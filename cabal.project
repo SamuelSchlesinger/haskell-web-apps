@@ -1,0 +1,7 @@
+source-repository-package
+  type: git
+  location: git@github.com:haskell-servant/servant-ekg.git
+  tag: 6dc27930c34f38ee391a1d4d57dc436438abddd0
+
+packages: ./
+

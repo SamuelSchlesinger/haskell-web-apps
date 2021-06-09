@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveAnyClass #-}
@@ -22,6 +24,8 @@ module WebApp
 import qualified Servant (Handler(Handler), Context)
 import qualified Servant.Server.Internal.Context as ServantContext
 import qualified Servant.Server.Internal.ErrorFormatter as ServantErrorFormatter
+import Data.Word (Word16)
+import Data.Function ((&))
 import Servant (ServerT, ServerError, throwError, serveWithContext, hoistServerWithContext, HasServer)
 import Control.Monad.Reader (ReaderT(runReaderT))
 import Control.Monad.Except (ExceptT(ExceptT))
@@ -35,6 +39,17 @@ import qualified Network.Wai.Handler.Warp as Warp (Settings, runSettings)
 import Data.Kind (Type)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
+import Network.Wai (Middleware)
+import System.Remote.Monitoring (forkServerWith)
+import System.Metrics (Store, newStore)
+import Servant.Ekg (monitorEndpoints, HasEndpoint)
+import Data.Streaming.Network.Internal (HostPreference(..))
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as Char8
+import Network.Wai.Middleware.RequestLogger (outputFormat, mkRequestLogger, OutputFormat(CustomOutputFormatWithDetails))
+import Network.Wai.Middleware.RequestLogger.JSON (formatAsJSON)
+import Data.Default.Class (def)
+
 
 import Servant (EmptyAPI, emptyServer)
 import GHC.Generics (Generic)
@@ -42,6 +57,7 @@ import qualified Network.Wai.Handler.Warp as Warp
 
 class
   ( HasServer (API app) (ContextTypes app)
+  , HasEndpoint (API app)
   , KnownSymbol (ConfigFilePath app)
   , FromJSON (Config app)
   , ToJSON (Config app)
@@ -61,6 +77,9 @@ class
   -- | The warp settings in the config.
   warpSettings :: Config app -> Warp.Settings
 
+  -- | The port to run EKG on.
+  ekgPort :: Config app -> Word16
+
   -- | The default name of the file where the config is kept.
   type ConfigFilePath app :: Symbol
 
@@ -74,6 +93,9 @@ class
 
   -- | Creates the 'Servant.Context' which allows us to run the server.
   createContext :: Web app (Servant.Context (ContextTypes app))
+
+  -- | Creates the 'Middleware' which will be applied to the application.
+  createMiddleware :: Web app Middleware
   
   -- | The set of endpoints for the application.
   type API app :: Type
@@ -90,14 +112,20 @@ class
   -- | The server for the application.
   server :: ServerT (API app) (Web app)
 
-runApp :: forall app. WebApp app => IO ()
-runApp = do
+data Env = Dev | Prod
+
+runApp :: forall app. WebApp app => Env -> IO ()
+runApp env = do
   let configFilePath = symbolVal (Proxy @(ConfigFilePath app))
   config <- eitherDecodeFileStrict configFilePath >>= onLeft couldn'tDecodeConfig
   state <- newState @app config 
   context <- runWithState state createContext
+  store <- newStore
+  monitor <- monitorEndpoints (Proxy @(API app)) store
+  requestLogger <- mkRequestLogger (def { outputFormat = CustomOutputFormatWithDetails formatAsJSON })
+  middleware <- runWithState state createMiddleware
   let
-    application =
+    (middleware . monitor . requestLogger -> application) =
       serveWithContext
         (Proxy @(API app))
         context
@@ -107,6 +135,8 @@ runApp = do
           (ioToHandler . runWithState @app state)
           (server @app)
         )
+    host = Warp.getHost (warpSettings @app config)
+  forkServerWith store "localhost" (fromIntegral $ ekgPort config)
   Warp.runSettings (warpSettings @app config) application
   where
     ioToHandler :: IO a -> Servant.Handler a
@@ -120,21 +150,3 @@ runApp = do
       hPutStrLn stderr $ "Could not decode configuration... Error message: " <> err
       exitFailure
 
-data Boring
-
-instance WebApp Boring where
-  type API Boring = EmptyAPI
-  type ConfigFilePath Boring = "boring.json"
-  data Config Boring = BoringConfig
-    deriving stock (Generic)
-    deriving anyclass (ToJSON, FromJSON)
-  newtype Web Boring a = WebBoring { unWebBoring :: IO a }
-    deriving newtype (Functor, Applicative, Monad)
-  type ContextTypes Boring = '[]
-  data State Boring = BoringState
-  warpSettings _ = Warp.defaultSettings
-  createContext = pure ServantContext.EmptyContext
-  newState _ = pure BoringState
-  askConfig = pure BoringConfig
-  runWithState _ = unWebBoring
-  server = emptyServer
